@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zero-shot-cleaning-assessment"
+version = "0.1.0"
+description = "Zero-shot assessment of territory cleaning quality from before/after images."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "ZeroShotCleaningAssessment contributors" }
+]
+dependencies = [
+    "gradio>=4.0",
+    "pycocotools>=2.0",
+    "pillow>=10.0",
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "transformers>=4.40",
+    "ultralytics>=8.3",
+    "numpy>=1.26",
+    "lightglue @ git+https://github.com/cvg/LightGlue.git",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4",
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
