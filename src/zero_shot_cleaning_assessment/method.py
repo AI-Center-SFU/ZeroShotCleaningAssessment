@@ -20,15 +20,73 @@ ImageInput = Image.Image | str | Path
 DEFAULT_DETECTION_CLASSES = [
     "a plastic bottle",
     "a glass bottle",
+    "a glass jar",
     "a metal can",
-    "a plastic bag",
+    "a food can",
+    "a drink can",
     "a food wrapper",
+    "a candy wrapper",
+    "a snack wrapper",
+    "a foil wrapper",
+    "a plastic packaging",
+    "a plastic packet",
+    "a snack bag",
+    "a plastic shopping bag",
     "a paper bag",
     "a plastic container",
+    "a food container",
+    "a takeaway container",
+    "a foam container",
+    "a cardboard box",
+    "a carton",
+    "a milk carton",
+    "a juice carton",
+    "a food tray",
+    "a plastic tray",
+    "a disposable plate",
+    "a paper plate",
+    "a plastic plate",
+    "a disposable bowl",
     "a cup",
+    "a paper cup",
+    "a plastic cup",
+    "a lid",
+    "a plastic lid",
+    "a bottle cap",
     "a straw",
     "a cigarette",
+    "a napkin",
+    "a piece of paper",
 ]
+
+DEFAULT_DETECTION_ALIASES = {
+    "aluminum can": "metal can",
+    "aluminium can": "metal can",
+    "beverage can": "drink can",
+    "can": "metal can",
+    "wrapper": "food wrapper",
+    "packet": "plastic packet",
+    "package": "plastic packaging",
+    "packaging": "plastic packaging",
+    "plastic bag": "plastic shopping bag",
+    "shopping bag": "plastic shopping bag",
+    "plate": "disposable plate",
+    "bowl": "disposable bowl",
+    "tray": "food tray",
+    "container": "plastic container",
+    "box": "cardboard box",
+    "paper": "piece of paper",
+    "cap": "bottle cap",
+}
+
+BLOCKED_DETECTION_LABEL_TERMS = (
+    "trash bag",
+    "garbage bag",
+    "waste bag",
+    "rubbish bag",
+    "black bag",
+    "black plastic bag",
+)
 
 
 @dataclass
@@ -46,6 +104,16 @@ class ZeroShotCleaningAssessmentConfig:
     @property
     def detection_prompt(self) -> str:
         return ". ".join(self.detection_classes) + "."
+
+    @property
+    def allowed_detection_labels(self) -> set[str]:
+        labels = set()
+        for class_name in self.detection_classes:
+            normalized = normalize_detection_label(class_name)
+            labels.add(normalized)
+            labels.add(normalized.removeprefix("a ").strip())
+        labels.update(DEFAULT_DETECTION_ALIASES)
+        return labels
 
 
 @dataclass
@@ -206,6 +274,12 @@ class ZeroShotCleaningAssessment:
             labels,
             strict=False,
         ):
+            label = normalize_detection_label(label)
+            if is_blocked_detection_label(label):
+                continue
+            if label not in self.config.allowed_detection_labels:
+                continue
+            label = DEFAULT_DETECTION_ALIASES.get(label, label)
             detections.append(
                 {
                     "label": label,
@@ -227,3 +301,11 @@ class ZeroShotCleaningAssessment:
         if torch.backends.mps.is_available():
             return "mps"
         return "cpu"
+
+
+def normalize_detection_label(label: object) -> str:
+    return str(label).strip().lower()
+
+
+def is_blocked_detection_label(label: str) -> bool:
+    return any(term in label for term in BLOCKED_DETECTION_LABEL_TERMS)
