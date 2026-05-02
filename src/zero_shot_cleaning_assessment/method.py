@@ -92,12 +92,16 @@ BLOCKED_DETECTION_LABEL_TERMS = (
 @dataclass
 class ZeroShotCleaningAssessmentConfig:
     model_match: str = "lightglue"
-    model_detect: str = "IDEA-Research/grounding-dino-base"
+    model_detect: str = "ensemble"
+    grounding_dino_model: str = "IDEA-Research/grounding-dino-base"
+    owl_vit_model: str = "google/owlvit-base-patch32"
+    yolo_world_model: str = "yolov8x-world.pt"
     detection_classes: list[str] = field(default_factory=lambda: DEFAULT_DETECTION_CLASSES.copy())
     match_threshold: int = 77
     clean_threshold: float = 50.0
     box_threshold: float = 0.27
     text_threshold: float = 0.25
+    ensemble_nms_threshold: float = 0.5
     max_keypoints: int = 2048
     device: str | None = None
 
@@ -136,6 +140,11 @@ class ZeroShotCleaningAssessment:
         self.model_match = None
         self.processor = None
         self.model_detect = None
+        self.grounding_dino_processor = None
+        self.grounding_dino_model = None
+        self.owl_vit_processor = None
+        self.owl_vit_model = None
+        self.yolo_world_model = None
         self.matched_points: list[dict[str, list[float]]] = []
 
     def assess(self, image_before: ImageInput, image_after: ImageInput) -> CleaningAssessmentResult:
@@ -203,11 +212,36 @@ class ZeroShotCleaningAssessment:
             self.model_match = LightGlue(features="superpoint").eval().to(self.device)
 
     def _load_detect_model(self) -> None:
+        if self.config.model_detect == "ensemble":
+            self._load_ensemble_detect_models()
+            return
+
         if self.model_detect is None:
             self.processor = AutoProcessor.from_pretrained(self.config.model_detect)
             self.model_detect = AutoModelForZeroShotObjectDetection.from_pretrained(
                 self.config.model_detect,
             ).eval().to(self.device)
+
+    def _load_ensemble_detect_models(self) -> None:
+        if self.grounding_dino_model is None:
+            self.grounding_dino_processor = AutoProcessor.from_pretrained(
+                self.config.grounding_dino_model,
+            )
+            self.grounding_dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+                self.config.grounding_dino_model,
+            ).eval().to(self.device)
+
+        if self.owl_vit_model is None:
+            self.owl_vit_processor = AutoProcessor.from_pretrained(self.config.owl_vit_model)
+            self.owl_vit_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+                self.config.owl_vit_model,
+            ).eval().to(self.device)
+
+        if self.yolo_world_model is None:
+            from ultralytics import YOLOWorld
+
+            self.yolo_world_model = YOLOWorld(self.config.yolo_world_model)
+            self.yolo_world_model.set_classes(self.config.detection_classes)
 
     def match_images(self, image_before: Image.Image, image_after: Image.Image) -> int:
         """Return the number of matched keypoints between before/after images."""
@@ -249,6 +283,16 @@ class ZeroShotCleaningAssessment:
         """Return detected pollution objects for configured text classes."""
         self._load_detect_model()
 
+        if self.config.model_detect == "ensemble":
+            detections = []
+            detections.extend(self._detect_grounding_dino(image))
+            detections.extend(self._detect_owl_vit(image))
+            detections.extend(self._detect_yolo_world(image))
+            return nms_detections(detections, self.config.ensemble_nms_threshold)
+
+        return self._detect_grounding_dino_single_model(image)
+
+    def _detect_grounding_dino_single_model(self, image: Image.Image) -> list[dict[str, Any]]:
         inputs = self.processor(
             images=image,
             text=self.config.detection_prompt,
@@ -290,6 +334,120 @@ class ZeroShotCleaningAssessment:
 
         return detections
 
+    def _detect_grounding_dino(self, image: Image.Image) -> list[dict[str, Any]]:
+        inputs = self.grounding_dino_processor(
+            images=image,
+            text=self.config.detection_prompt,
+            return_tensors="pt",
+        ).to(self.device)
+
+        with torch.inference_mode():
+            outputs = self.grounding_dino_model(**inputs)
+
+        results = self.grounding_dino_processor.post_process_grounded_object_detection(
+            outputs,
+            inputs["input_ids"],
+            threshold=self.config.box_threshold,
+            text_threshold=self.config.text_threshold,
+            target_sizes=[image.size[::-1]],
+        )[0]
+
+        return self._detections_from_grounded_results(results, source="grounding-dino")
+
+    def _detect_owl_vit(self, image: Image.Image) -> list[dict[str, Any]]:
+        inputs = self.owl_vit_processor(
+            text=[self.config.detection_classes],
+            images=image,
+            return_tensors="pt",
+        ).to(self.device)
+
+        with torch.inference_mode():
+            outputs = self.owl_vit_model(**inputs)
+
+        results = self.owl_vit_processor.post_process_grounded_object_detection(
+            outputs=outputs,
+            threshold=self.config.box_threshold,
+            target_sizes=torch.tensor([image.size[::-1]], device=self.device),
+            text_labels=[self.config.detection_classes],
+        )[0]
+
+        detections = []
+        labels = results.get("text_labels", results["labels"])
+        for box, score, label in zip(
+            results["boxes"],
+            results["scores"],
+            labels,
+            strict=False,
+        ):
+            if isinstance(label, torch.Tensor):
+                label = self.config.detection_classes[int(label.detach().cpu())]
+            detection = self._build_detection(box, score, label, source="owl-vit")
+            if detection is not None:
+                detections.append(detection)
+        return detections
+
+    def _detect_yolo_world(self, image: Image.Image) -> list[dict[str, Any]]:
+        results = self.yolo_world_model.predict(
+            image,
+            conf=self.config.box_threshold,
+            device=self.device,
+            verbose=False,
+        )
+        if not results or results[0].boxes is None:
+            return []
+
+        detections = []
+        result = results[0]
+        for box, score, class_id in zip(
+            result.boxes.xyxy,
+            result.boxes.conf,
+            result.boxes.cls,
+            strict=False,
+        ):
+            label = result.names[int(class_id.detach().cpu())]
+            detection = self._build_detection(box, score, label, source="yolo-world")
+            if detection is not None:
+                detections.append(detection)
+        return detections
+
+    def _detections_from_grounded_results(
+        self,
+        results: dict[str, Any],
+        source: str,
+    ) -> list[dict[str, Any]]:
+        detections = []
+        labels = results.get("text_labels", results["labels"])
+        for box, score, label in zip(
+            results["boxes"],
+            results["scores"],
+            labels,
+            strict=False,
+        ):
+            detection = self._build_detection(box, score, label, source=source)
+            if detection is not None:
+                detections.append(detection)
+        return detections
+
+    def _build_detection(
+        self,
+        box: torch.Tensor,
+        score: torch.Tensor,
+        label: object,
+        source: str,
+    ) -> dict[str, Any] | None:
+        label = normalize_detection_label(label)
+        if is_blocked_detection_label(label):
+            return None
+        if label not in self.config.allowed_detection_labels:
+            return None
+        label = DEFAULT_DETECTION_ALIASES.get(label, label)
+        return {
+            "label": label,
+            "source": source,
+            "score": float(score.detach().cpu()),
+            "box": [float(value) for value in box.detach().cpu().tolist()],
+        }
+
     def compute_cleaning_score(self, objects_before: int, objects_after: int) -> float:
         return (1 - objects_after / objects_before) * 100
 
@@ -309,3 +467,43 @@ def normalize_detection_label(label: object) -> str:
 
 def is_blocked_detection_label(label: str) -> bool:
     return any(term in label for term in BLOCKED_DETECTION_LABEL_TERMS)
+
+
+def nms_detections(
+    detections: list[dict[str, Any]],
+    iou_threshold: float,
+) -> list[dict[str, Any]]:
+    detections = sorted(detections, key=lambda detection: detection["score"], reverse=True)
+    kept = []
+
+    while detections:
+        current = detections.pop(0)
+        kept.append(current)
+        detections = [
+            detection
+            for detection in detections
+            if box_iou(current["box"], detection["box"]) < iou_threshold
+        ]
+
+    return kept
+
+
+def box_iou(box_a: list[float], box_b: list[float]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    intersection_x1 = max(ax1, bx1)
+    intersection_y1 = max(ay1, by1)
+    intersection_x2 = min(ax2, bx2)
+    intersection_y2 = min(ay2, by2)
+    intersection_width = max(0.0, intersection_x2 - intersection_x1)
+    intersection_height = max(0.0, intersection_y2 - intersection_y1)
+    intersection_area = intersection_width * intersection_height
+    if intersection_area == 0:
+        return 0.0
+
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union_area = area_a + area_b - intersection_area
+    if union_area == 0:
+        return 0.0
+    return intersection_area / union_area
