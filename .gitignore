@@ -194,6 +194,11 @@ cython_debug/
 # Experiment outputs
 outputs/
 
+# Model weights
+*.pt
+*.pth
+*.safetensors
+
 # PyPI configuration file
 .pypirc
 
